@@ -2,18 +2,19 @@ vLLM SM120/SM121 all-NVFP4 DFlash2 community release
 
 Copyright 2026 Sean Your Highness and contributors.
 
-This distribution contains modifications to vLLM v0.27.1, licensed under the
-Apache License, Version 2.0. The source overlay is provided as
-0001-v0271-sm12x-dflash2-nvfp4.patch (51 files, Python-only). Upstream:
-https://github.com/vllm-project/vllm
+This distribution contains modifications to vLLM v0.28.0, licensed under the
+Apache License, Version 2.0. The modifications and upstream backport are
+provided in patches/, in the order listed in patches/series. They include
+Python and CUDA source changes. See patches/README.md for attribution and
+upstream references. Upstream: https://github.com/vllm-project/vllm
 
 The default target model is not included in this repository or runtime image:
 gittensor-model-hub/Qwen3.8-27B-NVFP4-RTX5090 (Apache-2.0), downloaded
 directly from Hugging Face at the revision recorded in .env.example.
 
-The DFlash2 draft model (seanyourhighness/Qwen3.8-27B-DFlash2-NVFP4) is a
+The DFlash2 draft model (YourHighnessLA/Qwen3.8-27B-DFlash2-NVFP4) is a
 community NVFP4 requantization of z-lab/Qwen3.8-27B-DFlash2 (Apache-2.0),
-built with the release image's compressed-tensors 0.17.0.
+created with compressed-tensors 0.17.0.
 
 This project is not affiliated with or endorsed by the vLLM project, NVIDIA,
 Qwen, or Hugging Face.

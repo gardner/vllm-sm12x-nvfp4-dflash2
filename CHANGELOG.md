@@ -1,5 +1,26 @@
 # Changelog — vllm-sm12x-nvfp4-dflash2
 
+## v0.28.0 source update (2026-09-08, GPU validation pending)
+
+- Pin the latest stable vLLM release, v0.28.0 (`2cf0a6915`), and use its
+  DFlash2 implementation and official FlashInfer dependency.
+- Reduce the upstream patch footprint from 54 files to 11, including tests.
+  Retain SM12x NVFP4 attention/cache compatibility, quantized draft support,
+  draft execution fixes, and upstream's fused interleaved M-RoPE fix.
+- Remove dynamic-K, ReplaySSM experiments, custom window overrides, unused
+  instrumentation, obsolete backports, and the old image-layer Dockerfiles.
+- Pass architecture and concurrency settings to the official Dockerfile's
+  build arguments. Apply both patches to every build and select the non-root
+  image stage explicitly.
+- Default to a local v0.28.0 image tag; no new registry image is published.
+  Check source/manifest image labels at startup to reject stale `.env` images.
+- Add CPU regression checks and an SM12x native writer/FA2/masked-XQA gate.
+  Docker build and GPU serving validation remain pending.
+
+Migration instructions are in [README.md](README.md#upgrading-from-v0271).
+Patch rationale and upstream references are in [patches/README.md](patches/README.md).
+
+
 ## NIAH gate fix (2026-08-28)
 
 `verify.sh --full` no longer crashes with `TypeError: argument of type

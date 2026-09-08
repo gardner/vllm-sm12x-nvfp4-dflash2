@@ -13,7 +13,14 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Check scripts, Compose, checksums, and patch applicability
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install CPU test dependencies
+        run: |
+          python -m pip install pytest numpy
+          python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
+      - name: Check scripts, Compose, checksums, and patched upstream behavior
         env:
-          CHECK_PATCH_APPLY: "1"
+          CHECK_PATCH_APPLY: '1'
         run: ./scripts/check-release.sh

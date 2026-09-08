@@ -1,0 +1,655 @@
+diff --git a/csrc/libtorch_stable/nvfp4_kv_cache_kernels.cu b/csrc/libtorch_stable/nvfp4_kv_cache_kernels.cu
+index bb11e47..f491acf 100644
+--- a/csrc/libtorch_stable/nvfp4_kv_cache_kernels.cu
++++ b/csrc/libtorch_stable/nvfp4_kv_cache_kernels.cu
+@@ -285,7 +285,13 @@ __global__ void reshape_and_cache_nvfp4_kernel(
+       if (sf_out_ptr != nullptr) {
+         int scale_idx = group_in_head;
+         uint8_t* __restrict__ scale_dst;
+-        if (kv == 0) {
++#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1200 && __CUDA_ARCH__ < 1300
++        // SM12x FA2/XQA consume linear scales for both K and V.
++        constexpr bool linear_v_scales = true;
++#else
++        constexpr bool linear_v_scales = false;
++#endif
++        if (kv == 0 || linear_v_scales) {
+           scale_dst = scale_block + head * scale_head_stride +
+                       block_offset * scale_block_offset_stride + scale_idx;
+         } else {
+diff --git a/tests/v1/attention/test_attention_backends.py b/tests/v1/attention/test_attention_backends.py
+index cb35864..e1182f7 100644
+--- a/tests/v1/attention/test_attention_backends.py
++++ b/tests/v1/attention/test_attention_backends.py
+@@ -3,6 +3,7 @@
+ """Tests for v1 attention backends without GPUModelRunner dependency."""
+ 
+ from functools import partial
++from types import SimpleNamespace
+ 
+ import pytest
+ import torch
+@@ -817,6 +818,126 @@ def test_flashinfer_xqa_query_lens_require_exact_uniform_product():
+     assert q_cu_seq_lens.tolist() == [0, 3, 3, 3]
+ 
+ 
++@pytest.mark.skipif(
++    AttentionBackendEnum.FLASHINFER not in BACKENDS_TO_TEST,
++    reason="FlashInfer is not available.",
++)
++def test_flashinfer_sm120_nvfp4_uses_model_dtype_for_both_phases(monkeypatch):
++    from vllm.v1.attention.backends import flashinfer as flashinfer_backend
++
++    builder = object.__new__(flashinfer_backend.FlashInferMetadataBuilder)
++    builder.cache_dtype = "nvfp4"
++    builder.model_config = SimpleNamespace(dtype=torch.bfloat16)
++    builder.vllm_config = SimpleNamespace(
++        attention_config=SimpleNamespace(disable_flashinfer_q_quantization=False)
++    )
++    monkeypatch.setattr(
++        flashinfer_backend.current_platform,
++        "is_device_capability",
++        lambda capability: False,
++    )
++    monkeypatch.setattr(
++        flashinfer_backend.current_platform,
++        "is_device_capability_family",
++        lambda capability: capability == 120,
++    )
++    monkeypatch.setattr(flashinfer_backend, "force_use_trtllm_attention", lambda: None)
++
++    assert builder.get_q_data_type(is_prefill=False) == torch.bfloat16
++    assert builder.get_q_data_type(is_prefill=True) == torch.bfloat16
++
++
++@pytest.mark.skipif(
++    AttentionBackendEnum.FLASHINFER not in BACKENDS_TO_TEST,
++    reason="FlashInfer is not available.",
++)
++def test_flashinfer_xqa_isolated_stream_fork_and_join(monkeypatch):
++    from vllm.v1.attention.backends import flashinfer as flashinfer_backend
++
++    events: list[tuple[str, ...]] = []
++
++    class FakeStream:
++        def __init__(self, name):
++            self.name = name
++
++        def wait_stream(self, stream):
++            events.append((self.name, "wait", stream.name))
++
++    class FakeStreamContext:
++        def __enter__(self):
++            events.append(("side", "enter"))
++
++        def __exit__(self, *_):
++            events.append(("side", "exit"))
++
++    current = FakeStream("current")
++    side = FakeStream("side")
++    monkeypatch.setattr(
++        flashinfer_backend.envs,
++        "VLLM_FLASHINFER_XQA_USE_ISOLATED_STREAM",
++        True,
++    )
++    monkeypatch.setattr(
++        flashinfer_backend.torch.cuda, "current_stream", lambda: current
++    )
++    monkeypatch.setattr(
++        flashinfer_backend.torch.cuda, "stream", lambda stream: FakeStreamContext()
++    )
++    monkeypatch.setattr(flashinfer_backend, "_get_xqa_isolated_stream", lambda: side)
++
++    with flashinfer_backend._xqa_isolated_stream_scope(enabled=True):
++        events.append(("body",))
++
++    assert events == [
++        ("side", "wait", "current"),
++        ("side", "enter"),
++        ("body",),
++        ("side", "exit"),
++        ("current", "wait", "side"),
++    ]
++
++
++@pytest.mark.skipif(
++    AttentionBackendEnum.FLASHINFER not in BACKENDS_TO_TEST,
++    reason="FlashInfer is not available.",
++)
++@pytest.mark.parametrize(("configured", "enabled"), [(False, True), (True, False)])
++def test_flashinfer_xqa_isolated_stream_disabled_is_noop(
++    monkeypatch, configured, enabled
++):
++    from vllm.v1.attention.backends import flashinfer as flashinfer_backend
++
++    monkeypatch.setattr(
++        flashinfer_backend.envs,
++        "VLLM_FLASHINFER_XQA_USE_ISOLATED_STREAM",
++        configured,
++    )
++    monkeypatch.setattr(
++        flashinfer_backend,
++        "_get_xqa_isolated_stream",
++        lambda: pytest.fail("isolated stream must not be created"),
++    )
++
++    with flashinfer_backend._xqa_isolated_stream_scope(enabled):
++        pass
++
++
++@pytest.mark.skipif(
++    AttentionBackendEnum.FLASHINFER not in BACKENDS_TO_TEST,
++    reason="FlashInfer is not available.",
++)
++def test_flashinfer_xqa_isolated_stream_requires_eager_warmup(monkeypatch):
++    from vllm.v1.attention.backends import flashinfer as flashinfer_backend
++
++    monkeypatch.setattr(flashinfer_backend, "_xqa_isolated_stream", None)
++    monkeypatch.setattr(
++        flashinfer_backend.torch.cuda, "is_current_stream_capturing", lambda: True
++    )
++
++    with pytest.raises(RuntimeError, match="eager XQA warmup"):
++        flashinfer_backend._get_xqa_isolated_stream()
++
++
+ @pytest.mark.skipif(
+     AttentionBackendEnum.FLASHINFER not in BACKENDS_TO_TEST,
+     reason="FlashInfer is not available.",
+diff --git a/vllm/config/speculative.py b/vllm/config/speculative.py
+index 2b93113..493c80e 100644
+--- a/vllm/config/speculative.py
++++ b/vllm/config/speculative.py
+@@ -321,6 +321,10 @@ class SpeculativeConfig:
+             "dspark",
+         )
+         factors.append(uses_aux_hidden_states)
++        if self.method == "dflash":
++            # Draft width changes the compiled graph and persistent buffers.
++            factors.append(self.num_speculative_tokens)
++            factors.append(self.enforce_eager)
+ 
+         if uses_aux_hidden_states and self.draft_model_config is not None:
+             factors.append(self.draft_model_config.compute_hash())
+diff --git a/vllm/envs.py b/vllm/envs.py
+index ed62659..c974888 100755
+--- a/vllm/envs.py
++++ b/vllm/envs.py
+@@ -215,6 +215,7 @@ if TYPE_CHECKING:
+     VLLM_FLASHINFER_AUTOTUNE_SKIP_OPS: list[str] | None = None
+     VLLM_FLASHINFER_ALLREDUCE_BACKEND: Literal["auto", "trtllm", "mnnvl"] = "auto"
+     VLLM_FLASHINFER_WORKSPACE_BUFFER_SIZE: int = 394 * 1024 * 1024
++    VLLM_FLASHINFER_XQA_USE_ISOLATED_STREAM: bool = False
+     VLLM_XGRAMMAR_CACHE_MB: int = 0
+     VLLM_REGEX_COMPILATION_TIMEOUT_S: int = 5
+     VLLM_MSGPACK_ZERO_COPY_THRESHOLD: int = 256
+@@ -1736,6 +1737,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
+     "VLLM_FLASHINFER_WORKSPACE_BUFFER_SIZE": lambda: int(
+         os.getenv("VLLM_FLASHINFER_WORKSPACE_BUFFER_SIZE", str(394 * 1024 * 1024))
+     ),
++    # Run SM120 NVFP4 XQA decode on an isolated CUDA stream.
++    "VLLM_FLASHINFER_XQA_USE_ISOLATED_STREAM": lambda: bool(
++        int(os.getenv("VLLM_FLASHINFER_XQA_USE_ISOLATED_STREAM", "0"))
++    ),
+     # Control the maximum number of tokens per expert supported by the
+     # NVFP4 MoE CUTLASS Kernel. This value is used to create a buffer for
+     # the blockscale tensor of activations NVFP4 Quantization.
+diff --git a/vllm/model_executor/models/qwen3_dflash.py b/vllm/model_executor/models/qwen3_dflash.py
+index 4102044..3170255 100644
+--- a/vllm/model_executor/models/qwen3_dflash.py
++++ b/vllm/model_executor/models/qwen3_dflash.py
+@@ -23,6 +23,7 @@ from vllm.model_executor.layers.linear import (
+     QKVParallelLinear,
+     ReplicatedLinear,
+     RowParallelLinear,
++    UnquantizedLinearMethod,
+ )
+ from vllm.model_executor.layers.logits_processor import LogitsProcessor
+ from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
+@@ -31,6 +32,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
+     ParallelLMHead,
+     VocabParallelEmbedding,
+ )
++from vllm.model_executor.model_loader.utils import configure_quant_config
+ from vllm.multimodal.inputs import NestedTensors
+ from vllm.transformers_utils.config import set_default_rope_theta
+ from vllm.transformers_utils.repo_utils import get_hf_file_bytes
+@@ -378,6 +380,7 @@ class DFlashQwen3DecoderLayer(nn.Module):
+ @support_torch_compile
+ class DFlashQwen3Model(nn.Module):
+     decoder_layer_cls = DFlashQwen3DecoderLayer
++    packed_modules_mapping = Qwen3ForCausalLM.packed_modules_mapping
+ 
+     hf_to_vllm_mapper = WeightsMapper(
+         orig_to_new_substr={
+@@ -408,6 +411,8 @@ class DFlashQwen3Model(nn.Module):
+         self.config = vllm_config.speculative_config.draft_model_config.hf_config
+         self.vocab_size = self.config.vocab_size
+         self.quant_config = get_draft_quant_config(vllm_config)
++        if self.quant_config is not None:
++            configure_quant_config(self.quant_config, type(self))
+ 
+         drafter_config = getattr(self.config, "eagle_config", {})
+         drafter_config.update(getattr(self.config, "dflash_config", {}))
+@@ -486,14 +491,23 @@ class DFlashQwen3Model(nn.Module):
+     ) -> None:
+         self._hidden_norm_weight = self.hidden_norm.weight.data
+ 
+-        # KV projection weights: [num_layers * 2 * kv_size, hidden_size]
+-        kv_weights = [a.qkv_proj.weight[a.q_size :] for a in layers_attn]
+-        self._fused_kv_weight = torch.cat(kv_weights, dim=0)
+-        if has_bias:
+-            kv_biases = [a.qkv_proj.bias[a.q_size :] for a in layers_attn]
+-            self._fused_kv_bias: torch.Tensor | None = torch.cat(kv_biases, dim=0)
+-        else:
++        self._context_attn_layers = layers_attn
++        self._context_kv_quantized = any(
++            not isinstance(a.qkv_proj.quant_method, UnquantizedLinearMethod)
++            for a in layers_attn
++        )
++        if self._context_kv_quantized:
++            self._fused_kv_weight = None
+             self._fused_kv_bias = None
++        else:
++            # KV projection weights: [num_layers * 2 * kv_size, hidden_size]
++            kv_weights = [a.qkv_proj.weight[a.q_size :] for a in layers_attn]
++            self._fused_kv_weight = torch.cat(kv_weights, dim=0)
++            if has_bias:
++                kv_biases = [a.qkv_proj.bias[a.q_size :] for a in layers_attn]
++                self._fused_kv_bias: torch.Tensor | None = torch.cat(kv_biases, dim=0)
++            else:
++                self._fused_kv_bias = None
+ 
+         # K-norm weights stacked into one contiguous [num_layers, head_dim]
+         # tensor so the per-layer K-norm runs as a single grouped kernel.
+@@ -560,6 +574,18 @@ class DFlashQwen3Model(nn.Module):
+             self._hidden_norm_weight,
+             self._rms_norm_eps,
+         )
++        if self._context_kv_quantized:
++            # Dispatch through each layer's quantization method so packed weights
++            # and their scales are applied together.
++            projected = []
++            for attn in self._context_attn_layers:
++                qkv, _ = attn.qkv_proj(normed_context_states)
++                projected.append(
++                    qkv[:, attn.q_size :].reshape(num_ctx, 2, num_kv_heads, head_dim)
++                )
++            all_kv = torch.stack(projected, dim=1).permute(2, 1, 0, 3, 4).contiguous()
++            return all_kv[0], all_kv[1]
++
+         all_kv_flat = F.linear(
+             normed_context_states, self._fused_kv_weight, self._fused_kv_bias
+         )
+diff --git a/vllm/model_executor/models/qwen3_dflash2.py b/vllm/model_executor/models/qwen3_dflash2.py
+index cb02729..4e9b89c 100644
+--- a/vllm/model_executor/models/qwen3_dflash2.py
++++ b/vllm/model_executor/models/qwen3_dflash2.py
+@@ -170,7 +170,10 @@ def _score_edges(
+     anchor_token_ids: torch.Tensor,
+     top_k: int,
+ ) -> torch.Tensor:
+-    successors = successor_table[candidate_ids]
++    # Warmup may supply sentinel IDs. Keep compiled codebook gathers in bounds;
++    # valid serving IDs are unchanged and warmup outputs are discarded.
++    vocab_size = successor_table.shape[0]
++    successors = successor_table[candidate_ids.clamp(0, vocab_size - 1)]
+     predecessor_ids = torch.cat(
+         (
+             anchor_token_ids[:, None, None].expand(-1, 1, top_k),
+@@ -178,7 +181,7 @@ def _score_edges(
+         ),
+         dim=1,
+     )
+-    predecessors = predecessor_table[predecessor_ids]
++    predecessors = predecessor_table[predecessor_ids.clamp(0, vocab_size - 1)]
+     return unary_logits[:, :, None] + torch.einsum(
+         "blpr,blcr->blpc", predecessors * hidden[:, :, None], successors
+     )
+diff --git a/vllm/v1/attention/backends/flashinfer.py b/vllm/v1/attention/backends/flashinfer.py
+index de51e21..3eebeac 100755
+--- a/vllm/v1/attention/backends/flashinfer.py
++++ b/vllm/v1/attention/backends/flashinfer.py
+@@ -2,6 +2,8 @@
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ """Attention layer with FlashInfer."""
+ 
++from collections.abc import Iterator
++from contextlib import contextmanager
+ from dataclasses import dataclass, replace
+ from enum import Enum
+ from functools import partial
+@@ -106,6 +108,39 @@ def _get_trtllm_workspace_buffer():
+     return trtllm_workspace_buffer
+ 
+ 
++_xqa_isolated_stream: torch.cuda.Stream | None = None
++
++
++def _get_xqa_isolated_stream() -> torch.cuda.Stream:
++    """Return the process-stable stream used for NVFP4 XQA decode."""
++    global _xqa_isolated_stream
++    if _xqa_isolated_stream is None:
++        if torch.cuda.is_current_stream_capturing():
++            raise RuntimeError(
++                "VLLM_FLASHINFER_XQA_USE_ISOLATED_STREAM requires an eager "
++                "XQA warmup before CUDA graph capture."
++            )
++        _xqa_isolated_stream = torch.cuda.Stream()
++    return _xqa_isolated_stream
++
++
++@contextmanager
++def _xqa_isolated_stream_scope(enabled: bool) -> Iterator[None]:
++    """Run a kernel on the isolated XQA stream with capture-safe ordering."""
++    if not (envs.VLLM_FLASHINFER_XQA_USE_ISOLATED_STREAM and enabled):
++        yield
++        return
++
++    stream = _get_xqa_isolated_stream()
++    current = torch.cuda.current_stream()
++    stream.wait_stream(current)
++    try:
++        with torch.cuda.stream(stream):
++            yield
++    finally:
++        current.wait_stream(stream)
++
++
+ def _pack_draft_block_bool_mask(
+     bool_mask: torch.Tensor, num_packed: int
+ ) -> torch.Tensor:
+@@ -520,7 +555,7 @@ class FlashInferBackend(AttentionBackend):
+                 current_platform.is_device_capability_family(100)
+                 and supports_trtllm_attention(is_prefill=True)
+                 and supports_trtllm_attention(is_prefill=False)
+-            )
++            ) or current_platform.is_device_capability_family(120)
+         return super().supports_kv_cache_dtype(kv_cache_dtype)
+ 
+     @classmethod
+@@ -562,7 +597,7 @@ class FlashInferBackend(AttentionBackend):
+     @classmethod
+     def get_required_kv_cache_layout(cls) -> KVCacheLayoutType | None:
+         capability = current_platform.get_device_capability()
+-        if capability is not None and capability.major == 10:
++        if capability is not None and capability.major in (10, 12):
+             return "HND"
+         return None
+ 
+@@ -782,13 +817,17 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
+         self.head_dim = self.kv_cache_spec.head_size
+         self.page_size = self.kv_cache_spec.block_size
+ 
++        self.use_fa2_nvfp4_kv = (
++            self.kv_cache_spec.kv_quant_mode.is_nvfp4
++            and current_platform.is_device_capability_family(120)
++        )
+         if self.kv_cache_spec.kv_quant_mode != KVQuantMode.NONE:
+             self.cache_dtype = self.cache_config.cache_dtype
+             # Cannot use self.kv_cache_spec.dtype here because kv_cache_spec
+             # storage dtype may not be the same as the op dtype (uint8 vs fp8_e4m3)
+             self.is_kvcache_nvfp4 = self.cache_dtype.startswith("nvfp4")
+             if self.is_kvcache_nvfp4:
+-                if (
++                if not self.use_fa2_nvfp4_kv and (
+                     force_use_trtllm_attention() is False
+                     or not supports_trtllm_attention(is_prefill=True)
+                     or not supports_trtllm_attention(is_prefill=False)
+@@ -960,6 +999,8 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
+                 return FlashInferBackend.get_dtype_for_flashinfer(cache_dtype)
+             return self.model_config.dtype
+         if cache_dtype.startswith("nvfp4"):
++            if current_platform.is_device_capability_family(120):
++                return self.model_config.dtype
+             return FlashInferBackend.get_dtype_for_flashinfer("fp8_e4m3")
+         return self.kv_cache_spec.dtype
+ 
+@@ -1125,7 +1166,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
+                 raise NotImplementedError(
+                     "FlashInfer non-causal prefill is not supported with DCP yet."
+                 )
+-            if self.is_kvcache_nvfp4:
++            if self.is_kvcache_nvfp4 and not self.use_fa2_nvfp4_kv:
+                 raise NotImplementedError(
+                     "FlashInfer non-causal attention is not supported with "
+                     "NVFP4 KV cache."
+@@ -1149,7 +1190,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
+                         BatchPrefillWithPagedKVCacheWrapper(
+                             self._get_workspace_buffer(),
+                             get_kv_cache_layout(),
+-                            backend="auto",
++                            backend="fa2" if self.use_fa2_nvfp4_kv else "auto",
+                         )
+                     )
+             return self._noncausal_prefill_wrapper
+@@ -1174,9 +1215,14 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
+                         window_left=self.window_left,
+                     )
+                 else:
+-                    # NVFP4 KV cache requires the trtllm-gen backend inside
+-                    # the wrapper; fa2/fa3 do not support nvfp4.
+-                    backend = "trtllm-gen" if self.is_kvcache_nvfp4 else "auto"
++                    # SM12x consumes NVFP4 through FA2; SM100 uses TRTLLM.
++                    backend = (
++                        "fa2"
++                        if self.use_fa2_nvfp4_kv
++                        else "trtllm-gen"
++                        if self.is_kvcache_nvfp4
++                        else "auto"
++                    )
+                     self._prefill_wrapper = BatchPrefillWithPagedKVCacheWrapper(
+                         self._get_workspace_buffer(),
+                         get_kv_cache_layout(),
+@@ -1200,9 +1246,14 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
+                 paged_kv_indptr = None
+                 paged_kv_indices = None
+                 paged_kv_last_page_len = None
+-            # NVFP4 KV cache requires the trtllm-gen backend inside
+-            # the wrapper; fa2/fa3 do not support nvfp4.
+-            backend = "trtllm-gen" if self.is_kvcache_nvfp4 else "auto"
++            # SM12x consumes NVFP4 through FA2; SM100 uses TRTLLM.
++            backend = (
++                "fa2"
++                if self.use_fa2_nvfp4_kv
++                else "trtllm-gen"
++                if self.is_kvcache_nvfp4
++                else "auto"
++            )
+             decode_wrapper = BatchDecodeWithPagedKVCacheWrapper(
+                 self._get_workspace_buffer(),
+                 get_kv_cache_layout(),
+@@ -1607,7 +1658,9 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
+                     # use FP8 o_data_type so the wrapper matches the
+                     # FP8 output buffer allocated in forward().
+                     o_dtype = (
+-                        FP8_DTYPE if self.is_kvcache_nvfp4 else self.model_config.dtype
++                        FP8_DTYPE
++                        if self.is_kvcache_nvfp4 and not self.use_fa2_nvfp4_kv
++                        else self.model_config.dtype
+                     )
+                     prefill_wrapper.plan(
+                         qo_indptr=qo_indptr_prefill_cpu,
+@@ -1692,7 +1745,9 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
+                 # use FP8 o_data_type so the wrapper matches the
+                 # FP8 output buffer allocated in forward().
+                 o_dtype = (
+-                    FP8_DTYPE if self.is_kvcache_nvfp4 else self.model_config.dtype
++                    FP8_DTYPE
++                    if self.is_kvcache_nvfp4 and not self.use_fa2_nvfp4_kv
++                    else self.model_config.dtype
+                 )
+                 fast_plan_decode(
+                     decode_wrapper,
+@@ -1762,6 +1817,9 @@ class FlashInferImpl(AttentionImpl):
+         )
+         self.cache_dtype = kv_cache_dtype
+         self.is_kvcache_nvfp4 = kv_cache_dtype.startswith("nvfp4")
++        self.use_fa2_nvfp4_kv = (
++            self.is_kvcache_nvfp4 and current_platform.is_device_capability_family(120)
++        )
+         self.kv_cache_dtype = "nvfp4" if self.is_kvcache_nvfp4 else kv_cache_dtype
+         self.fp4_data_dim = head_size // 2 if self.is_kvcache_nvfp4 else 0
+         self.logits_soft_cap = logits_soft_cap
+@@ -1808,7 +1866,11 @@ class FlashInferImpl(AttentionImpl):
+         self.o_sf_scale: float | None = None
+ 
+         # Pre-allocated FP8 output buffer for NVFP4 without fused output quant.
+-        if self.is_kvcache_nvfp4 and vllm_config is not None:
++        if (
++            self.is_kvcache_nvfp4
++            and not self.use_fa2_nvfp4_kv
++            and vllm_config is not None
++        ):
+             max_num_tokens = vllm_config.scheduler_config.max_num_batched_tokens
+             self._nvfp4_fp8_out = torch.empty(
+                 (max_num_tokens, num_heads, head_size),
+@@ -2061,7 +2123,6 @@ class FlashInferImpl(AttentionImpl):
+         )
+         if decode_with_dedicated_xqa:
+             assert not use_dcp
+-            assert not self.is_kvcache_nvfp4
+             assert self.o_sf_scale is None
+             assert output.dtype != FP4_DTYPE
+ 
+@@ -2128,7 +2189,9 @@ class FlashInferImpl(AttentionImpl):
+                     # Use a pre-allocated FP8 buffer and dequantize
+                     # afterwards.
+                     needs_fp8_out_prefill = (
+-                        self.is_kvcache_nvfp4 and output.dtype != FP8_DTYPE
++                        self.is_kvcache_nvfp4
++                        and not self.use_fa2_nvfp4_kv
++                        and output.dtype != FP8_DTYPE
+                     )
+                     if needs_fp8_out_prefill:
+                         out_prefill = self._nvfp4_fp8_out[:num_prefill_tokens]
+@@ -2195,7 +2258,11 @@ class FlashInferImpl(AttentionImpl):
+ 
+                 # NVFP4 trtllm kernel only supports FP8 output.
+                 # Use a pre-allocated FP8 buffer and dequantize afterwards.
+-                needs_fp8_out = self.is_kvcache_nvfp4 and output.dtype != FP8_DTYPE
++                needs_fp8_out = (
++                    self.is_kvcache_nvfp4
++                    and not self.use_fa2_nvfp4_kv
++                    and output.dtype != FP8_DTYPE
++                )
+                 if needs_fp8_out:
+                     out = self._nvfp4_fp8_out[:num_prefill_tokens]
+ 
+@@ -2298,7 +2365,11 @@ class FlashInferImpl(AttentionImpl):
+ 
+                 # NVFP4 kernel only supports FP8 output.
+                 # Use a pre-allocated FP8 buffer and dequantize afterwards.
+-                needs_fp8_out = self.is_kvcache_nvfp4 and output.dtype != FP8_DTYPE
++                needs_fp8_out = (
++                    self.is_kvcache_nvfp4
++                    and not self.use_fa2_nvfp4_kv
++                    and output.dtype != FP8_DTYPE
++                )
+                 if needs_fp8_out:
+                     out_decode = self._nvfp4_fp8_out[:num_decode_tokens]
+                 else:
+@@ -2394,23 +2465,29 @@ class FlashInferImpl(AttentionImpl):
+                     )
+                     q_len_per_req = attn_metadata.decode.q_len_per_req
+ 
+-                    flashinfer_xqa_batch_decode_with_kv_cache(
+-                        query=decode_query,
+-                        kv_cache=kv_cache_tuple,
+-                        workspace_buffer=workspace_buffer,
+-                        block_tables=block_tables_decode,
+-                        seq_lens=seq_lens_decode,
+-                        max_seq_len=attn_metadata.decode.max_seq_len,
+-                        bmm1_scale=bmm1_scale,
+-                        bmm2_scale=self.bmm2_scale,
+-                        window_left=self.window_left,
+-                        out=output[:num_decode_tokens],
+-                        sinks=self.sinks,
+-                        kv_layout=get_kv_cache_layout(),
+-                        q_len_per_req=q_len_per_req,
+-                        mask=attn_metadata.decode.mask,
+-                        q_cu_seq_lens=attn_metadata.decode.q_cu_seq_lens,
+-                    )
++                    with _xqa_isolated_stream_scope(self.is_kvcache_nvfp4):
++                        flashinfer_xqa_batch_decode_with_kv_cache(
++                            query=decode_query,
++                            kv_cache=nvfp4_kv_data
++                            if self.is_kvcache_nvfp4
++                            else kv_cache_tuple,
++                            workspace_buffer=workspace_buffer,
++                            block_tables=block_tables_decode,
++                            seq_lens=seq_lens_decode,
++                            max_seq_len=attn_metadata.decode.max_seq_len,
++                            bmm1_scale=bmm1_scale,
++                            bmm2_scale=self.bmm2_scale,
++                            window_left=self.window_left,
++                            out=output[:num_decode_tokens],
++                            sinks=self.sinks,
++                            kv_layout=get_kv_cache_layout(),
++                            q_len_per_req=q_len_per_req,
++                            mask=attn_metadata.decode.mask,
++                            kv_cache_sf=nvfp4_kv_block_scales
++                            if self.is_kvcache_nvfp4
++                            else None,
++                            q_cu_seq_lens=attn_metadata.decode.q_cu_seq_lens,
++                        )
+                     return output_padded
+ 
+                 if output.dtype == FP4_DTYPE:
+@@ -2427,7 +2504,11 @@ class FlashInferImpl(AttentionImpl):
+ 
+                 # NVFP4 trtllm kernel only supports FP8 output.
+                 # Use a pre-allocated FP8 buffer and dequantize afterwards.
+-                needs_fp8_out = self.is_kvcache_nvfp4 and output.dtype != FP8_DTYPE
++                needs_fp8_out = (
++                    self.is_kvcache_nvfp4
++                    and not self.use_fa2_nvfp4_kv
++                    and output.dtype != FP8_DTYPE
++                )
+                 if needs_fp8_out:
+                     out = self._nvfp4_fp8_out[:num_decode_tokens]
+ 
+diff --git a/vllm/v1/worker/gpu/spec_decode/dflash/speculator.py b/vllm/v1/worker/gpu/spec_decode/dflash/speculator.py
+index eb5dc47..32129e2 100644
+--- a/vllm/v1/worker/gpu/spec_decode/dflash/speculator.py
++++ b/vllm/v1/worker/gpu/spec_decode/dflash/speculator.py
+@@ -39,6 +39,12 @@ class DFlashSpeculator(DraftModelSpeculator):
+             self.max_num_tokens, self.hidden_size, dtype=self.dtype, device=device
+         )
+ 
++        # Embed outside the compiled forward to avoid data-dependent symbolic
++        # indices during draft warmup. Keep the buffer stable for CUDA graphs.
++        self.inputs_embeds = torch.zeros(
++            self.max_num_tokens, self.hidden_size, dtype=self.dtype, device=device
++        )
++
+         # Multimodal inputs not currently supported.
+         self.supports_mm_inputs = False
+ 
+@@ -124,7 +130,7 @@ class DFlashSpeculator(DraftModelSpeculator):
+                 self.attn_cg_support.min_cg_attn_backend,
+             )
+         # PIECEWISE cudagraphs are not supported for dflash.
+-        if wants_full and supports_full:
++        if wants_full and supports_full and not self.speculative_config.enforce_eager:
+             cudagraph_mode = CUDAGraphMode.FULL_DECODE_ONLY
+         else:
+             cudagraph_mode = CUDAGraphMode.NONE
+@@ -235,10 +241,15 @@ class DFlashSpeculator(DraftModelSpeculator):
+             slot_mapping=slot_mappings,
+             batch_descriptor=batch_descriptor,
+         ):
++            # Keep embedding lookup outside the compiled forward. This uses the
++            # same model embedding method, including any mask-token handling.
++            self.inputs_embeds[:num_tokens] = self.model.embed_input_ids(
++                self.input_buffers.input_ids[:num_tokens]
++            )
+             last_hidden_states = self.model(
+-                input_ids=self.input_buffers.input_ids[:num_tokens],
++                input_ids=None,
+                 positions=self.input_buffers.positions[:num_tokens],
+-                inputs_embeds=None,
++                inputs_embeds=self.inputs_embeds[:num_tokens],
+             )
+         return last_hidden_states
+ 

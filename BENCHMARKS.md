@@ -1,5 +1,8 @@
 # Benchmarks — what to expect on a single RTX 5090 (SM120)
 
+> Historical v0.27.1 results. The current v0.28.0 source build has not yet
+> been built or benchmarked on a GPU. These measurements do not validate it.
+
 All numbers measured on the published `v0.27.1-sm12x-dflash2.3` image,
 single RTX 5090 (32 GB, SM120), model `qwen3.8-27b-nvfp4-dflash2`.
 GPU decode/prefill from `bench.sh` (3 warm + 5 measured, cache-busted).

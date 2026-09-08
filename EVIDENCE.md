@@ -1,5 +1,28 @@
 # Evidence — all-NVFP4 DFlash2 release (RTX 5090 / SM120)
 
+> Historical v0.27.1 results. The current v0.28.0 source build has not yet
+> been built or benchmarked on a GPU. These measurements do not validate it.
+
+## v0.28.0 source checks (2026-09-08)
+
+The maintained patches were applied to a fresh clone of upstream v0.28.0,
+commit `2cf0a6915ce544dc493a0990f2ea38d81601128a`.
+
+- `CHECK_PATCH_APPLY=1 ./scripts/check-release.sh`: passed artifact hashes,
+  shell syntax, default configuration checks, patch application, and Python
+  compilation. All 27 CPU source regressions passed with Python 3.12.
+- Both YAML files parsed. Docker Compose rendering was skipped because the
+  Docker CLI is unavailable in this environment.
+- SM120 and SM121 build scripts passed a command-level check with Docker
+  mocked and a real local upstream clone. The check verified every build
+  argument against the upstream Dockerfile, both patches, the non-root
+  stage, image labels, and rejection of stale images at startup.
+- No Docker image was built or published. CUDA kernels, model loading,
+  serving correctness, and performance have not been validated on this
+  update. The new GPU gate is `tests/test_sm12x_nvfp4.py`.
+
+The remaining sections record the previous v0.27.1 release.
+
 Compiled 2026-08-25 from the validated production runs. Source of record:
 GBrain `vllm/2026-08-21-qwen38-dflash2-nvfp4-release-plan`,
 `sessions/2026-08-24-dflash2-capacity-k7-production-promotion`,

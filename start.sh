@@ -4,7 +4,7 @@
 #   ./start.sh              # multimodal-capable server, no CPU sidecar
 #   ./start.sh --vision     # server + bounded CPU vision sidecar
 #
-# Checks GPU/SM, VRAM, Docker/Compose, disk, and ports; pulls the pinned
+# Checks GPU/SM, VRAM, Docker/Compose, and disk; selects the built
 # runtime; downloads the pinned target + draft checkpoints into named
 # Docker volumes; starts vLLM; waits for health; and sends a real chat
 # completion.
@@ -17,6 +17,12 @@ set -a
 # shellcheck disable=SC1091
 source .env
 set +a
+source "$ROOT/release.env"
+
+if [[ -n "${DYNAMIC_SCHEDULE:-}" ]]; then
+  echo "error: DYNAMIC_SCHEDULE is no longer supported; remove it from .env and use fixed K" >&2
+  exit 2
+fi
 
 # These values are interpolated into JSON / integer CLI arguments in
 # compose.yaml. Reject placeholder or malformed values before pulling images or
@@ -82,6 +88,16 @@ case "$IMAGE" in
     docker compose "${files[@]}" pull
     ;;
 esac
+
+# Reject an old .env image before starting containers with the new arguments.
+expected_manifest="$(sha256sum "$ROOT/SHA256SUMS" | cut -d' ' -f1)"
+image_revision="$(docker image inspect --format '{{index .Config.Labels "ai.bickford.vllm.upstream-revision"}}' "$IMAGE")"
+image_manifest="$(docker image inspect --format '{{index .Config.Labels "ai.bickford.vllm.manifest-sha256"}}' "$IMAGE")"
+if [[ "$image_revision" != "$VLLM_COMMIT" || "$image_manifest" != "$expected_manifest" ]]; then
+  echo "error: IMAGE does not match this checkout's vLLM release and patch manifest" >&2
+  echo "Run ./build.sh and update IMAGE in .env to the resulting tag ($DEFAULT_IMAGE by default)." >&2
+  exit 1
+fi
 
 # Docker-GPU check on the exact device the container will see.
 docker run --rm \
