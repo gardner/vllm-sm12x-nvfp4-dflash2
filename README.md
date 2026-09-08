@@ -1,228 +1,258 @@
-# vLLM All-NVFP4 DFlash2 for Blackwell (SM120 / SM121) + Optional Vision Sidecar
+# vLLM with NVFP4 and DFlash2 for Blackwell GPUs
 
-Community vLLM build for a single Blackwell GPU: ModelOpt **NVFP4 target
-weights**, **NVFP4 DFlash2 draft weights**, **NVFP4 KV cache**, and **DFlash2
-K=7 block-diffusion speculative decoding** — 262K context, four concurrent
-streams, tool calling, and an optional bounded CPU vision sidecar that turns
-images into embeddings for the vLLM server.
+This repository provides a community build of vLLM v0.27.1 for serving
+Qwen3.8-27B on a single Blackwell GPU. It uses ModelOpt NVFP4 target weights,
+NVFP4 DFlash2 draft weights, and an NVFP4 KV cache. The default configuration supports a
+262,144-token context limit, up to four concurrent sequences, and tool
+calling. An optional CPU vision sidecar converts images into embeddings
+for the vLLM server.
 
-> This is not an official vLLM or NVIDIA image. It is a pinned community
-> overlay on vLLM v0.27.1, validated on an RTX 5090 (SM120, 32 GB). The SM121
-> (DGX Spark / GB10) build ships under the same contract; see
-> [SM121 notes](#sm121--dgx-spark--gb10).
+The release is validated on an RTX 5090 (SM120, 32 GB). A build configuration
+is also provided for DGX Spark / GB10 (SM121), but it has not been validated
+on that hardware. This is a community project, independent of the official
+vLLM and NVIDIA releases.
 
-## What makes this stack different
+## Overview
 
-- **All-NVFP4, end to end.** Target weights, DFlash2 draft weights, and the KV
-  cache are all NVFP4. No public 5090 recipe ships 4-of-4 (NVFP4 weights +
-  NVFP4 KV + DFlash2 + concurrency); the universal pattern is NVFP4 weights +
-  FP8 KV.
-- **DFlash2 K7 speculative decoding.** A 5-layer block-diffusion drafter
-  (1.92B) proposes 7 tokens per verification step (8 target query tokens),
-  with FULL_AND_PIECEWISE CUDA graphs `[8,16,24,32]` and an eager drafter
-  that avoids integrated XQA graph interference. Measured ~61% draft
-  acceptance and ~2.3x aggregate throughput vs. the legacy c3 profile.
-- **Capacity-first profile.** Explicit 8 GiB NVFP4 KV pin → 325,139-token
-  pool at 262K max context, BF16 GDN/SSM state, prefix caching, priority
-  scheduling, chunked prefill.
-- **Fused multimodal decode.** The `.3` incremental overlay extends the
-  fused QK-norm + RoPE + gate Triton kernel to Qwen3.5's three-axis M-RoPE,
-  preserving the fast decode path while `--enable-mm-embeds` is active.
-- **Optional bounded CPU vision.** `./start.sh --vision` enables the 8-CPU,
-  6-GB sidecar (INT8-quantized ViT tower by default); ordinary text serving
-  can use the same multimodal-capable server without starting the sidecar.
+- **NVFP4 weights and KV cache.** Both the target and draft models use
+  NVFP4 weights and KV caches. GDN/SSM state uses BF16.
+- **DFlash2 speculative decoding.** A 5-layer, 1.92B-parameter
+  block-diffusion draft model proposes seven tokens per verification step
+  (`K=7`). Each step uses eight target query tokens.
+- **Context and concurrency.** The default profile allocates 8 GiB to the
+  target KV cache, providing a measured pool of 325,139 tokens shared across
+  active sequences. It enables prefix caching, priority scheduling, and
+  chunked prefill.
+- **Multimodal support.** Release `v0.27.1-sm12x-dflash2.3` adds support for
+  Qwen3.5's three-axis M-RoPE to the fused QK-norm, RoPE, and gate Triton
+  kernel. This keeps the fused decode path available when multimodal
+  embeddings are enabled.
+- **Optional CPU vision.** The sidecar uses an INT8-quantized ViT tower by
+  default, with limits of eight CPUs and 6 GB of memory. Text serving does
+  not require the sidecar.
 
-> **Vision status:** restored as an optional supported profile in
-> `v0.27.1-sm12x-dflash2.3`. The SM120 fixture and CUDA kernel gate passed;
-> SM121 remains unvalidated.
+## Getting started
 
-## Deploy in two commands
+You need Linux or WSL2, an RTX 5090, a working NVIDIA driver,
+[Docker Engine with the Compose plugin](https://docs.docker.com/engine/install/),
+and the [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html).
+The startup script also requires `curl` and `python3`. For DGX Spark / GB10,
+see the [SM121 build notes](#sm121-dgx-spark--gb10).
 
-Prerequisites: Linux or WSL2, an RTX 5090 (SM120) or DGX Spark/GB10 (SM121),
-a working NVIDIA driver, [Docker Engine with the Compose
-plugin](https://docs.docker.com/engine/install/), and the [NVIDIA Container
-Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html).
-Allow roughly 30 GB of downloads for the ~9 GB runtime image, the 20.6 GB
-target checkpoint, and the 1.3 GB draft model.
+Allow roughly 30 GB of downloads: about 9 GB for the runtime image, 20.6 GB
+for the target checkpoint, and 1.3 GB for the draft model. The startup script
+warns if less than 45 GB of disk space is available.
 
 ```bash
 git clone https://github.com/seanyourhighness/vllm-sm12x-nvfp4-dflash2.git
-cd vllm-sm12x-nvfp4-dflash2 && ./start.sh
+cd vllm-sm12x-nvfp4-dflash2
+./start.sh
 ```
 
-To start the bounded CPU vision sidecar as well:
+To include the CPU vision sidecar, use:
 
 ```bash
 ./start.sh --vision
 ```
 
-`start.sh` checks the GPU/SM, VRAM, Docker/Compose, disk space, and ports;
-pulls the pinned runtime; downloads the exact pinned target and draft
-checkpoints into Docker named volumes; starts vLLM; waits for health; and
-sends a real chat completion (deterministic canary: `19×23 → 437`).
+On first use, `start.sh` creates `.env` from `.env.example`. It checks the
+selected GPU, VRAM, Docker, and disk space; pulls the pinned runtime image;
+downloads the pinned model checkpoints into Docker named volumes; and
+starts vLLM. Once the server is healthy, it runs a chat completion smoke
+test that checks whether `19 × 23` returns `437`.
 
-On hosts with more than one GPU, set `GPU_DEVICE` in `.env` to the
-Blackwell card's index or UUID (default `0`). `start.sh` probes only that
-device and the compose stack exposes only that device to the container
-(`NVIDIA_VISIBLE_DEVICES`, `CUDA_DEVICE_ORDER=PCI_BUS_ID`), so an older
-second card cannot interfere with device selection or enumeration.
+On a host with multiple GPUs, create `.env` from `.env.example` before
+starting and set `GPU_DEVICE` to the Blackwell GPU's index or UUID. The
+default is `0`. The startup script checks that device, and Compose selects
+it through `NVIDIA_VISIBLE_DEVICES` with `CUDA_DEVICE_ORDER=PCI_BUS_ID`.
 
-Endpoints after startup:
+After startup, use these endpoints and model name:
 
-- OpenAI-compatible vLLM API: `http://127.0.0.1:18089/v1`
-- Vision-capable proxy (with `--vision`): `http://127.0.0.1:8016/v1`
-- Served model: `qwen3.8-27b-nvfp4-dflash2`
-
-First startup is dominated by the two downloads and CUDA/FlashInfer warmup.
-Subsequent starts reuse the Docker image and the named model caches.
-
-## Exact pinned stack
-
-| Component | Pinned artifact |
+| Service | URL |
 |---|---|
-| Runtime | `ghcr.io/seanyourhighness/vllm-sm12x-nvfp4-dflash2` (digest in `.env.example`; validated local tag `local-v0271-dflash2-capacity-k7-20260824`, image id `sha256:06f0c21d…`) |
-| Target model + revision | [`gittensor-model-hub/Qwen3.8-27B-NVFP4-RTX5090@69274a0`](https://huggingface.co/gittensor-model-hub/Qwen3.8-27B-NVFP4-RTX5090/tree/69274a0d8dff5dd35bcee8290612f71e03b6e981) |
-| Draft model | [`YourHighnessLA/Qwen3.8-27B-DFlash2-NVFP4`](https://huggingface.co/YourHighnessLA/Qwen3.8-27B-DFlash2-NVFP4) (`model.safetensors` sha256 `db19f849…`) |
-| vLLM base | [v0.27.1 commit `6e448d0ea`](https://github.com/vllm-project/vllm/commit/6e448d0ea9bf3d88d898b65449ca6dc2aec170ac) |
-| FlashInfer | 0.6.16.post3 (git `9dc1b24`), with [PR #4346](https://github.com/flashinfer-ai/flashinfer/pull/4346) SM120 NVFP4 paged-prefill backport |
-| Overlay | [`0001-v0271-sm12x-dflash2-nvfp4.patch`](0001-v0271-sm12x-dflash2-nvfp4.patch) (51 files, Python-only; `sha256:248adb62…`) |
-| Vision overlay | [`0002-qwen3-next-fused-mrope-vision.patch`](0002-qwen3-next-fused-mrope-vision.patch) (2 production Python files + targeted CUDA test; minimal layer recorded as 12,600 bytes) |
-| Minimal candidate image | [`Dockerfile.vision-mrope`](Dockerfile.vision-mrope) over the unchanged `.2` base |
-| Chat template | [`chat-template.jinja`](chat-template.jinja) (`sha256:398edf5b…`) |
-| Checksums | [`SHA256SUMS`](SHA256SUMS) |
+| OpenAI-compatible vLLM API | `http://127.0.0.1:18089/v1` |
+| Vision proxy, when started with `--vision` | `http://127.0.0.1:8016/v1` |
 
-The image and models are pinned by immutable digests/revisions, not floating
-tags. Compose passes the pinned model revision to vLLM and mounts the
-shipped release template with `--chat-template`; this intentionally
-overrides the different template bundled with the model. Model weights are
-not redistributed in the runtime image.
+Served model name: `qwen3.8-27b-nvfp4-dflash2`.
+
+The first startup includes model downloads and CUDA/FlashInfer warmup.
+Later starts reuse the downloaded image and model caches.
 
 ## Common operations
 
 ```bash
-./status.sh                 # containers, health, GPU, and model-cache status
-./verify.sh --smoke         # health + model routing + deterministic canary
-./verify.sh --full          # + long-decode determinism, NIAH, tool calling
-./verify.sh --vision       # exact two-image fixture + vision concurrency gate
-./stop.sh                   # stop + remove containers (volumes kept)
-./stop.sh --purge-cache     # also remove the named model/vllm/draft caches
+./status.sh                # Show containers, health, GPU, and model-cache status
+./verify.sh --smoke        # Check health, model routing, and the arithmetic test
+./verify.sh --full         # Also check long-decode determinism, retrieval, and tools
+./verify.sh --vision       # Run the two-image fixture and vision concurrency checks
+./stop.sh                  # Remove containers and keep cache volumes
+./stop.sh --purge-cache    # Also remove model, draft, and vLLM cache volumes
 ```
 
-## Validated runtime profile (the "everything we run" defaults)
+Run the vision checks after starting the sidecar with `./start.sh --vision`.
+The retrieval check in `--full` is a needle-in-a-haystack (NIAH) test.
 
-| Knob | Value |
+## Pinned components
+
+The default runtime image and model checkpoints use immutable digests or
+revisions. Their full values are in [.env.example](.env.example).
+
+| Component | Version or artifact |
 |---|---|
-| Speculative config | `{"method":"dflash","model":"/models/draft","num_speculative_tokens":7,"kv_cache_dtype":"nvfp4"}` |
-| Target KV cache | NVFP4, explicit 8 GiB pin (`8589934592` bytes) → 325,139-token pool |
+| Runtime image | `ghcr.io/seanyourhighness/vllm-sm12x-nvfp4-dflash2`, pinned by digest in `.env.example` |
+| Target model | [`gittensor-model-hub/Qwen3.8-27B-NVFP4-RTX5090`](https://huggingface.co/gittensor-model-hub/Qwen3.8-27B-NVFP4-RTX5090/tree/69274a0d8dff5dd35bcee8290612f71e03b6e981), revision `69274a0` |
+| Draft model | [`YourHighnessLA/Qwen3.8-27B-DFlash2-NVFP4`](https://huggingface.co/YourHighnessLA/Qwen3.8-27B-DFlash2-NVFP4), revision `d913b0b` |
+| vLLM base | [v0.27.1, commit `6e448d0ea`](https://github.com/vllm-project/vllm/commit/6e448d0ea9bf3d88d898b65449ca6dc2aec170ac) |
+| FlashInfer | 0.6.16.post3, commit `9dc1b24`, with the [PR #4346](https://github.com/flashinfer-ai/flashinfer/pull/4346) backport for SM120 NVFP4 paged prefill |
+| Main patch | [`0001-v0271-sm12x-dflash2-nvfp4.patch`](0001-v0271-sm12x-dflash2-nvfp4.patch), covering 51 Python files |
+| Vision patch | [`0002-qwen3-next-fused-mrope-vision.patch`](0002-qwen3-next-fused-mrope-vision.patch), covering two production Python files and a targeted CUDA test |
+| Vision image layer | [`Dockerfile.vision-mrope`](Dockerfile.vision-mrope), applied to the `.2` base image |
+| Chat template | [`chat-template.jinja`](chat-template.jinja) |
+| Artifact checksums | [`SHA256SUMS`](SHA256SUMS) |
+
+Compose passes the pinned target revision to vLLM and loads the repository's
+chat template with `--chat-template`. This replaces the template bundled
+with the model. Model weights are downloaded separately from the runtime
+image.
+
+## Default runtime configuration
+
+These settings were validated on the RTX 5090. The KV cache pool is shared:
+four active sequences have roughly 81K cached tokens each if the pool is
+divided equally.
+
+| Setting | Default |
+|---|---|
+| Speculative decoding | `{"method":"dflash","model":"/models/draft","num_speculative_tokens":7,"kv_cache_dtype":"nvfp4"}` |
+| Target KV cache | NVFP4; 8 GiB (`8589934592` bytes), with a measured 325,139-token pool |
 | GDN/SSM state | `bfloat16` |
-| Max model len | 262,144 |
-| Max concurrent seqs | 4 (capacity-first; ~81K cached tokens/lane at full load) |
-| Max batched tokens | 4,096 |
-| CUDA graphs | `FULL_AND_PIECEWISE`, capture sizes `[8,16,24,32]` (K7 → 8-token verifier queries) |
-| Drafter | forced eager (`VLLM_DFLASH_FORCE_EAGER=1`) — avoids integrated XQA graph interference |
-| Target XQA | dedicated CUDA stream (`VLLM_XQA_DEDICATED_STREAM=1`) |
-| FlashInfer autotune | enabled (loaded from the persisted autotune cache at boot) |
-| Scheduling | priority + prefix caching + chunked prefill, long-prefill threshold 2048 |
-| Sampling | temperature 0.6 override, thinking enabled (medium effort) |
-| Tooling | `--enable-auto-tool-choice --tool-call-parser qwen3_coder` |
-| Serving mode | `--enable-mm-embeds` + zero image/video limits; fused M-RoPE kernel |
-| Triton JIT cache | `/home/vllm/.cache/vllm/triton` (persisted in the named vLLM cache volume) |
+| Maximum context length | 262,144 tokens |
+| Maximum concurrent sequences | 4 |
+| Maximum batched tokens | 4,096 |
+| CUDA graphs | `FULL_AND_PIECEWISE`, capture sizes `[8,16,24,32]` |
+| Draft execution | Eager mode (`VLLM_DFLASH_FORCE_EAGER=1`) to avoid integrated XQA graph interference |
+| Target XQA | Dedicated CUDA stream (`VLLM_XQA_DEDICATED_STREAM=1`) |
+| FlashInfer autotuning | Enabled; cached results are loaded at startup |
+| Scheduling | Priority scheduling, prefix caching, and chunked prefill; long-prefill threshold of 2,048 tokens |
+| Sampling | Default temperature override of 0.6; thinking enabled with medium effort |
+| Tool calling | `--enable-auto-tool-choice --tool-call-parser qwen3_coder` |
+| Multimodal serving | `--enable-mm-embeds` with image and video limits set to zero; fused M-RoPE kernel |
+| Triton JIT cache | `/home/vllm/.cache/vllm/triton`, persisted in the vLLM cache volume |
 
-Measured on the RTX 5090 (SM120), published `v0.27.1-sm12x-dflash2.3`
-image (3 warm + 5 measured, cache-busted):
+## Performance
 
-| Concurrency | Narrative (tok/s) | Code (tok/s) |
+The following results were measured on a single RTX 5090 using the published
+`v0.27.1-sm12x-dflash2.3` image. The benchmark used three warmup runs and five
+measured runs, with cache busting.
+
+| Concurrent sequences | Narrative, total tokens/s | Code, total tokens/s |
 |---:|---:|---:|
-| c1 | ~98 | ~173 |
-| c2 | ~192 (agg) | ~330 (agg) |
-| c3 | ~278 (agg) | ~447 (agg) |
-| c4 | ~344 (agg) | ~587 (agg) |
+| 1 | ~98 | ~173 |
+| 2 | ~192 | ~330 |
+| 3 | ~278 | ~447 |
+| 4 | ~344 | ~587 |
 
-Per-lane decode stays flat (~90–97 narrative, ~169–189 code) across c1–c4;
-aggregate scales ~3.5× from c1 → c4 with ~61% draft acceptance at K7, zero
-restarts, zero OOM. See [BENCHMARKS.md](BENCHMARKS.md) for the TLDR of
-expected 5090 decode/prefill/vision numbers and [EVIDENCE.md](EVIDENCE.md)
-for the full measurement record.
+At four concurrent sequences, aggregate throughput was about 3.5 times the
+single-sequence result. Draft acceptance was approximately 61% at `K=7`.
+The reported runs had no restarts or out-of-memory errors.
 
-## Why the M-RoPE overlay is required
+See [BENCHMARKS.md](BENCHMARKS.md) for decode, prefill, and vision results
+and reproduction instructions. [EVIDENCE.md](EVIDENCE.md) contains the
+detailed measurement record.
 
-The CPU sidecar itself was idle during text requests and did not consume
-meaningful CPU. The slowdown came from keeping the GPU server in multimodal /
-embedding-capable mode. In the `.2` source, Qwen3.5's fused QK-norm + RoPE +
-gate decoder path did not support three-axis M-RoPE, so the multimodal path
-fell back to the slower eager sequence. `--limit-mm-per-prompt
-'{"image":0,"video":0}'` prunes the vision tower but does not fix that
-kernel-selection gap.
+## How the vision patch works
 
-The `.3` patch carries the narrow release backport: T/H/W M-RoPE section
-selection (contiguous and interleaved) is handled inside the existing Triton
-kernel, and Qwen3Next passes the full three-axis positions. The kernel JIT
-compiles on first use; no CUDA/native rebuild is required for the minimal
-Dockerfile overlay.
+The CPU sidecar encodes images and sends their embeddings to vLLM. The GPU
+server therefore runs with `--enable-mm-embeds`, even though the image and
+video limits are zero to exclude the GPU vision tower.
 
-On the same RTX 5090 release image and benchmark prompts, the old
-embedding-capable path measured narrative 61.6 and code 105.7 tok/s, versus
-language-only 116.2 and 202.4 tok/s. The `.3` candidate restores the
-multimodal configuration while preserving the matched c1-c4 decode profile;
-see [EVIDENCE.md](EVIDENCE.md) for the exact measurements.
+In the source used for release `.2`, the fused QK-norm, RoPE, and gate
+decoder kernel did not support Qwen3.5's three-axis M-RoPE. Enabling
+multimodal embeddings selected a slower eager path, including for text
+requests. The idle CPU sidecar was not the cause of the slowdown.
 
-Two upstream efforts cover the same general kernel area and are treated as
-duplicate work rather than a new upstream PR: [vLLM #49744](https://github.com/vllm-project/vllm/pull/49744)
-and [vLLM #43056](https://github.com/vllm-project/vllm/pull/43056). This release
-uses a narrower pinned-vLLM backport for the DFlash2 image.
+Release `.3` adds temporal, height, and width (T/H/W) position selection to
+the existing Triton kernel, supporting both contiguous and interleaved
+M-RoPE sections. Qwen3Next passes all three position axes to the kernel.
+Triton compiles the new variants on first use and saves them in the cache;
+the incremental image layer does not require a native CUDA rebuild.
 
-### Upgrade from `.2`
+In the RTX 5090 comparison, the older embedding-capable path produced
+61.6 narrative and 105.7 code tokens/s. The language-only path produced
+116.2 and 202.4 tokens/s, respectively. The `.3` patch restored multimodal
+support with decode performance comparable to the language-only
+configuration across one to four concurrent sequences. See
+[EVIDENCE.md](EVIDENCE.md) for the matched measurements and the passing
+SM120 CUDA and two-image fixture checks.
+
+Related upstream work is documented in
+[vLLM #49744](https://github.com/vllm-project/vllm/pull/49744) and
+[vLLM #43056](https://github.com/vllm-project/vllm/pull/43056). This release
+uses a smaller backport for its pinned vLLM version.
+
+### Upgrading from `.2`
+
+Update the repository and stop the existing containers:
 
 ```bash
 git pull --ff-only
 docker compose down --remove-orphans
+```
+
+Set `IMAGE` in your existing `.env` to the published digest in the updated
+`.env.example`. The startup script preserves an existing `.env`, so pulling
+the repository alone does not update that setting. Then start the server:
+
+```bash
 ./start.sh
 ```
 
-The `.2` base image and model artifacts are unchanged. Build the small
-candidate layer with `Dockerfile.vision-mrope`, set `IMAGE` to that candidate,
-then use `./start.sh` or `./start.sh --vision`. The first multimodal request
-will warm the new Triton kernel variants.
+Use `./start.sh --vision` to include the sidecar, then run
+`./verify.sh --vision` once it is healthy. The first multimodal request
+compiles the new Triton kernel variants.
 
-Run `./verify.sh --vision` for the exact two-image fixture and concurrency
-gate after the sidecar is healthy.
+The `.3` image adds a small layer to the `.2` base and uses the same model
+artifacts. To build that layer locally, use
+[`Dockerfile.vision-mrope`](Dockerfile.vision-mrope) and set `IMAGE` to the
+resulting local image.
 
-## Verify this release
+## Release verification
 
-Every artifact is pinned by immutable digest/revision, not floating tag, and
-the `release-integrity` workflow re-checks them on every push:
-
-```bash
-sha256sum --check SHA256SUMS   # patches, Dockerfile, template, sidecar, bench gates
-./verify.sh --full             # determinism, NIAH, tools
-./verify.sh --vision           # exact two-image fixture + vision concurrency gate
-```
-
-Expected 5090 decode/prefill/vision numbers, with the raw evidence and a
-reproduce path, are in [BENCHMARKS.md](BENCHMARKS.md); the full measurement
-record is in [EVIDENCE.md](EVIDENCE.md).
-
-## SM121 (DGX Spark / GB10)
-
-The same source + patch contract builds for `linux/arm64` with
-`torch_cuda_arch_list=12.1`:
+Check the local artifacts against their recorded checksums, then run the
+server checks:
 
 ```bash
-SPARK=1 ./build.sh          # native build on the Spark (fast path)
+sha256sum --check SHA256SUMS
+./verify.sh --full
+./verify.sh --vision        # Requires the running vision sidecar
 ```
 
-The SM121 build is **not yet natively validated** (no SM121 hardware was
-available at release time); the SM120 artifact and `.3` vision measurements
-are the validated release evidence.
-The multi-arch tag will not be promoted until the SM121 build passes the
-full correctness matrix (greedy determinism, NIAH, tools, c4 soak)
-natively on a GB10.
+The `release-integrity` workflow checks release integrity on every push.
+Benchmark results and reproduction instructions are in
+[BENCHMARKS.md](BENCHMARKS.md); validation details are in
+[EVIDENCE.md](EVIDENCE.md).
 
-## Rollback / coexistence
+## SM121: DGX Spark / GB10
 
-This release coexists with the MTP release (`vllm-sm120-nvfp4-mtp`) as a
-blue/green alternative: separate repo, image, Compose project
-(`qwen38-dflash2`), container names, ports (18089/8016 vs. 18079/8006), and
-model cache volumes. Only one 27B GPU server runs at a time on a single
-32 GiB card. Rollback: `./stop.sh`, then start the unchanged pinned MTP
-project.
+The build script supports `linux/arm64` with `torch_cuda_arch_list=12.1`
+using the same base source and main patch. Run it natively on the Spark:
+
+```bash
+SPARK=1 ./build.sh
+```
+
+SM121 has not been validated on native hardware. The published validation
+results, including the `.3` vision measurements, apply to SM120. The
+multi-architecture tag will be promoted after the SM121 build passes
+greedy determinism, NIAH retrieval, tool calling, and a four-sequence soak
+test on GB10 hardware.
+
+## Rollback and coexistence
+
+This project can be installed alongside the MTP release,
+`vllm-sm120-nvfp4-mtp`. It uses a separate repository, image, Compose project
+(`qwen38-dflash2`), container names, and model cache volumes. Its default
+ports are 18089 and 8016; the MTP release uses 18079 and 8006.
+
+Run only one 27B GPU server at a time on a single 32 GiB GPU. To switch back
+to MTP, run `./stop.sh`, then start the pinned MTP project.
